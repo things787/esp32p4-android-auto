@@ -1,0 +1,885 @@
+diff --git a/Super_VESC_Display/custom/custom.c b/Super_VESC_Display/custom/custom.c
+index c1db831..bd71378 100644
+--- a/Super_VESC_Display/custom/custom.c
++++ b/Super_VESC_Display/custom/custom.c
+@@ -1092,7 +1092,7 @@ static void cockpit_mode_text(uint8_t mode)
+     old_mode = mode;
+ 
+     char text[20];
+-    sprintf(text,"MODE %d", mode+1);
++    snprintf(text, sizeof(text), "%s", ride_profile_name(mode));
+     lv_label_set_text(guider_ui.dashboard_Classic_mode_text,text);
+ }
+ 
+diff --git a/Super_VESC_Display/custom/custom.h b/Super_VESC_Display/custom/custom.h
+index c54d583..50d5874 100644
+--- a/Super_VESC_Display/custom/custom.h
++++ b/Super_VESC_Display/custom/custom.h
+@@ -70,6 +70,21 @@ void lisp_panel_open_async(void);
+  * phone involvement. Defined in custom/pas_screen.c. */
+ void show_pas_settings(void);
+ 
++/* ---- PIN immobiliser + ride profiles (custom/lock_overlay.c) ----
++ *
++ * The lock itself lives on the VESC (lisp/main.lisp). These are the head-unit
++ * mirror: lock_overlay_set_state() is driven from the dashboard updater with
++ * the state the script reports, and puts up / tears down a full-screen PIN
++ * keypad on lv_layer_top(). Must be called from the LVGL task.
++ *
++ * show_profile_picker() opens the ECO / NORMAL / SPORT modal. Wire it to
++ * whatever gesture suits — a tap on the dashboard MODE label, or a Settings
++ * row. The handlebar TX button keeps cycling profiles on the VESC either way. */
++void        lock_overlay_set_state(bool locked, bool pin_set, int pin_tries);
++bool        lock_overlay_is_shown(void);
++void        show_profile_picker(void);
++const char *ride_profile_name(uint8_t idx);
++
+ void update_current(float current);
+ void update_speed(float speed);
+ void update_battery_proc(float battery_proc);
+diff --git a/Super_VESC_Display/custom/lock_overlay.c b/Super_VESC_Display/custom/lock_overlay.c
+new file mode 100644
+index 0000000..c421f46
+--- /dev/null
++++ b/Super_VESC_Display/custom/lock_overlay.c
+@@ -0,0 +1,319 @@
++/*
++ * PIN immobiliser overlay + ride-profile picker.
++ *
++ * The overlay lives on lv_layer_top() rather than being an lv_scr_load()
++ * screen, for two reasons:
++ *   - it must cover the Android Auto video output too, not just the dashboard
++ *     (ui_mode can be UI_MODE_AA while the bike is locked);
++ *   - it must not disturb the screen stack, so whatever the rider had open is
++ *     still there when the bike unlocks.
++ * Same trick splash_screen.c uses.
++ *
++ * IMPORTANT: this file is UI only. It cannot immobilise anything. The actual
++ * lock lives in the LispBM script on the VESC (lisp/main.lisp: `locked`,
++ * consulted by motor-control-loop) and the overlay only mirrors the state the
++ * script reports over the DASH packet. If this display is unplugged the bike
++ * stays locked; if this display lies, the bike does not care.
++ *
++ * Device-only — the desktop simulator gets no-op stubs at the bottom.
++ */
++#include "lvgl.h"
++#include "custom.h"
++
++#ifdef LV_REALDEVICE
++
++#include "vesc_can/vesc_lisp_panel.h"
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++
++/* palette — matches pas_screen.c / realtime_viewer.c */
++#define COL_BG      0x07090A
++#define COL_PANEL   0x12181C
++#define COL_BTN     0x2a3440
++#define COL_ACCENT  0xB6FF2E
++#define COL_RED     0xFF3B30
++#define COL_AMBER   0xFFA500
++#define COL_TEXT    0xFFFFFF
++#define COL_DIM     0x8A9499
++
++#define PIN_MAX_DIGITS 8
++
++static lv_obj_t *s_overlay;      /* full-screen container on lv_layer_top() */
++static lv_obj_t *s_dots;         /* masked PIN entry */
++static lv_obj_t *s_msg;          /* status / error line */
++static char      s_entry[PIN_MAX_DIGITS + 1];
++static int       s_entry_len;
++static int       s_last_tries = -1;
++static bool      s_waiting;      /* an unlock was sent, awaiting the DASH reply */
++
++static lv_obj_t *s_picker;       /* profile picker modal (independent of lock) */
++
++/* ---------------------------------------------------------------- helpers */
++
++const char *ride_profile_name(uint8_t idx)
++{
++    switch (idx) {
++    case 0:  return "ECO";
++    case 1:  return "NORMAL";
++    case 2:  return "SPORT";
++    default: return "MODE";
++    }
++}
++
++static void refresh_dots(void)
++{
++    char buf[PIN_MAX_DIGITS * 2 + 1];
++    int  n = 0;
++    for (int i = 0; i < s_entry_len && n < (int)sizeof(buf) - 2; i++) {
++        buf[n++] = '*';
++    }
++    buf[n] = '\0';
++    lv_label_set_text(s_dots, s_entry_len ? buf : "- - - -");
++}
++
++static void set_msg(const char *text, uint32_t colour)
++{
++    lv_label_set_text(s_msg, text);
++    lv_obj_set_style_text_color(s_msg, lv_color_hex(colour), 0);
++}
++
++/* --------------------------------------------------------------- keypad */
++
++static void key_cb(lv_event_t *e)
++{
++    lv_obj_t   *bm  = lv_event_get_target(e);
++    const char *txt = lv_btnmatrix_get_btn_text(bm, lv_btnmatrix_get_selected_btn(bm));
++    if (!txt) return;
++
++    if (strcmp(txt, LV_SYMBOL_BACKSPACE) == 0) {
++        if (s_entry_len > 0) s_entry[--s_entry_len] = '\0';
++        refresh_dots();
++        return;
++    }
++    if (strcmp(txt, LV_SYMBOL_OK) == 0) {
++        if (s_entry_len < 4) {
++            set_msg("PIN is at least 4 digits", COL_AMBER);
++            return;
++        }
++        /* strtol, not atoi: a leading-zero PIN like 0042 must not be read as
++         * octal, and we want the whole thing as a plain decimal integer since
++         * that is what the script hashes. */
++        long pin = strtol(s_entry, NULL, 10);
++        vesc_lisp_panel_send_unlock((int32_t)pin);
++        s_waiting   = true;
++        s_entry_len = 0;
++        s_entry[0]  = '\0';
++        refresh_dots();
++        set_msg("Checking...", COL_DIM);
++        return;
++    }
++    if (s_entry_len < PIN_MAX_DIGITS) {
++        s_entry[s_entry_len++] = txt[0];
++        s_entry[s_entry_len]   = '\0';
++        refresh_dots();
++    }
++}
++
++static const char *s_keymap[] = {
++    "1", "2", "3", "\n",
++    "4", "5", "6", "\n",
++    "7", "8", "9", "\n",
++    LV_SYMBOL_BACKSPACE, "0", LV_SYMBOL_OK, ""
++};
++
++static void build_overlay(void)
++{
++    s_overlay = lv_obj_create(lv_layer_top());
++    lv_obj_remove_style_all(s_overlay);
++    lv_obj_set_size(s_overlay, LV_PCT(100), LV_PCT(100));
++    lv_obj_set_style_bg_color(s_overlay, lv_color_hex(COL_BG), 0);
++    lv_obj_set_style_bg_opa(s_overlay, LV_OPA_COVER, 0);
++    lv_obj_clear_flag(s_overlay, LV_OBJ_FLAG_SCROLLABLE);
++    /* Eats every touch while shown, so nothing behind it can be operated. */
++    lv_obj_add_flag(s_overlay, LV_OBJ_FLAG_CLICKABLE);
++
++    lv_obj_t *title = lv_label_create(s_overlay);
++    lv_label_set_text(title, LV_SYMBOL_WARNING "  IMMOBILISED");
++    lv_obj_set_style_text_color(title, lv_color_hex(COL_RED), 0);
++    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
++    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 40, 46);
++
++    lv_obj_t *sub = lv_label_create(s_overlay);
++    /* Say this out loud on the screen: a rider who thinks the brakes are cut
++     * will do something stupid at a red light. */
++    lv_label_set_text(sub, "Enter PIN to ride.\nBrakes and lights are unaffected.");
++    lv_obj_set_style_text_color(sub, lv_color_hex(COL_DIM), 0);
++    lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 40, 96);
++
++    s_dots = lv_label_create(s_overlay);
++    lv_obj_set_style_text_color(s_dots, lv_color_hex(COL_ACCENT), 0);
++    lv_obj_set_style_text_font(s_dots, &lv_font_montserrat_28, 0);
++    lv_obj_align(s_dots, LV_ALIGN_TOP_LEFT, 40, 176);
++    refresh_dots();
++
++    s_msg = lv_label_create(s_overlay);
++    lv_obj_set_width(s_msg, 320);
++    lv_label_set_long_mode(s_msg, LV_LABEL_LONG_WRAP);
++    lv_obj_align(s_msg, LV_ALIGN_TOP_LEFT, 40, 224);
++    set_msg("", COL_DIM);
++
++    lv_obj_t *bm = lv_btnmatrix_create(s_overlay);
++    lv_btnmatrix_set_map(bm, s_keymap);
++    lv_obj_set_size(bm, 300, 360);
++    lv_obj_align(bm, LV_ALIGN_TOP_RIGHT, -40, 60);
++    lv_obj_set_style_bg_color(bm, lv_color_hex(COL_PANEL), 0);
++    lv_obj_set_style_border_width(bm, 0, 0);
++    lv_obj_set_style_bg_color(bm, lv_color_hex(COL_BTN), LV_PART_ITEMS);
++    lv_obj_set_style_text_color(bm, lv_color_hex(COL_TEXT), LV_PART_ITEMS);
++    lv_obj_set_style_text_font(bm, &lv_font_montserrat_28, LV_PART_ITEMS);
++    lv_obj_add_event_cb(bm, key_cb, LV_EVENT_VALUE_CHANGED, NULL);
++}
++
++/* ------------------------------------------------------------ public API */
++
++void lock_overlay_set_state(bool locked, bool pin_set, int pin_tries)
++{
++    if (!locked) {
++        if (s_overlay) {
++            lv_obj_del(s_overlay);
++            s_overlay    = NULL;
++            s_dots       = NULL;
++            s_msg        = NULL;
++            s_entry_len  = 0;
++            s_entry[0]   = '\0';
++            s_last_tries = -1;
++            s_waiting    = false;
++        }
++        return;
++    }
++    if (!pin_set) return;          /* locked with no PIN configured: no way in */
++
++    if (!s_overlay) {
++        build_overlay();
++        s_last_tries = pin_tries;
++    }
++
++    /* The script's wrong-PIN counter is the only "your PIN was wrong" signal we
++     * get — the reply to a failed unlock is just an unchanged DASH packet. */
++    if (pin_tries != s_last_tries) {
++        if (pin_tries > s_last_tries) {
++            if (pin_tries > 4) {
++                set_msg("Too many attempts - wait 30 s", COL_RED);
++            } else {
++                char buf[48];
++                snprintf(buf, sizeof(buf), "Wrong PIN (%d of 5)", pin_tries);
++                set_msg(buf, COL_RED);
++            }
++        }
++        s_last_tries = pin_tries;
++        s_waiting    = false;
++    }
++}
++
++bool lock_overlay_is_shown(void)
++{
++    return s_overlay != NULL;
++}
++
++/* ---------------------------------------------------- profile picker modal */
++
++static void picker_close(void)
++{
++    if (s_picker) {
++        lv_obj_del(s_picker);
++        s_picker = NULL;
++    }
++}
++
++static void picker_pick_cb(lv_event_t *e)
++{
++    int idx = (int)(intptr_t)lv_event_get_user_data(e);
++    vesc_lisp_panel_send_profile((int32_t)idx);
++    picker_close();
++}
++
++static void picker_dismiss_cb(lv_event_t *e)
++{
++    (void)e;
++    picker_close();
++}
++
++void show_profile_picker(void)
++{
++    if (s_picker) return;
++    if (lock_overlay_is_shown()) return;   /* pick a mode after you unlock */
++
++    vlp_dash_t d;
++    bool have = vesc_lisp_panel_get_dash(&d);
++    int  count = (have && d.profile_count > 0) ? d.profile_count : 3;
++    if (count > 3) count = 3;
++
++    s_picker = lv_obj_create(lv_layer_top());
++    lv_obj_remove_style_all(s_picker);
++    lv_obj_set_size(s_picker, LV_PCT(100), LV_PCT(100));
++    lv_obj_set_style_bg_color(s_picker, lv_color_black(), 0);
++    lv_obj_set_style_bg_opa(s_picker, LV_OPA_70, 0);
++    lv_obj_add_flag(s_picker, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_add_event_cb(s_picker, picker_dismiss_cb, LV_EVENT_CLICKED, NULL);
++
++    lv_obj_t *card = lv_obj_create(s_picker);
++    lv_obj_set_size(card, 560, 260);
++    lv_obj_center(card);
++    lv_obj_set_style_bg_color(card, lv_color_hex(COL_PANEL), 0);
++    lv_obj_set_style_border_width(card, 0, 0);
++    lv_obj_set_style_radius(card, 12, 0);
++    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
++
++    lv_obj_t *t = lv_label_create(card);
++    lv_label_set_text(t, "RIDE MODE");
++    lv_obj_set_style_text_color(t, lv_color_hex(COL_DIM), 0);
++    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 4);
++
++    for (int i = 0; i < count; i++) {
++        /* SPORT is PIN-gated in the script (sport-needs-pin). Grey it out when
++         * the PIN has not been entered this power cycle rather than letting the
++         * tap silently bounce off the VESC. */
++        bool gated = (i == 2) && have && d.pin_set && !d.pin_ok;
++
++        lv_obj_t *b = lv_btn_create(card);
++        lv_obj_set_size(b, 160, 120);
++        lv_obj_align(b, LV_ALIGN_CENTER, (i - 1) * 176, 16);
++        lv_obj_set_style_bg_color(b, lv_color_hex(gated ? COL_PANEL : COL_BTN), 0);
++        lv_obj_set_style_border_width(b, 2, 0);
++        lv_obj_set_style_border_color(b,
++            lv_color_hex((have && d.current_profile == i) ? COL_ACCENT : COL_BTN), 0);
++
++        lv_obj_t *l = lv_label_create(b);
++        lv_label_set_text(l, gated ? "SPORT\n" LV_SYMBOL_WARNING " PIN" : ride_profile_name(i));
++        lv_obj_set_style_text_color(l, lv_color_hex(gated ? COL_DIM : COL_TEXT), 0);
++        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
++        lv_obj_center(l);
++
++        if (!gated) {
++            lv_obj_add_event_cb(b, picker_pick_cb, LV_EVENT_CLICKED,
++                                (void *)(intptr_t)i);
++        }
++    }
++}
++
++#else  /* simulator */
++
++const char *ride_profile_name(uint8_t idx)
++{
++    switch (idx) {
++    case 0:  return "ECO";
++    case 1:  return "NORMAL";
++    case 2:  return "SPORT";
++    default: return "MODE";
++    }
++}
++void lock_overlay_set_state(bool locked, bool pin_set, int pin_tries)
++{
++    (void)locked; (void)pin_set; (void)pin_tries;
++}
++bool lock_overlay_is_shown(void) { return false; }
++void show_profile_picker(void) { }
++
++#endif
+diff --git a/Super_VESC_Display/custom/theme_dashboard_amber.c b/Super_VESC_Display/custom/theme_dashboard_amber.c
+index e61c618..57bc102 100644
+--- a/Super_VESC_Display/custom/theme_dashboard_amber.c
++++ b/Super_VESC_Display/custom/theme_dashboard_amber.c
+@@ -349,9 +349,7 @@ static void amber_mode_text(uint8_t mode)
+     static int old = -1;
+     if (mode == old) return;
+     old = mode;
+-    char text[16];
+-    snprintf(text, sizeof(text), "MODE %d", mode + 1);
+-    dash_label_set(guider_ui.dashboard_Amber_mode_text, text);
++    dash_label_set(guider_ui.dashboard_Amber_mode_text, ride_profile_name(mode));
+ }
+ 
+ static void amber_units_changed(void)
+diff --git a/Super_VESC_Display/custom/theme_generic.c b/Super_VESC_Display/custom/theme_generic.c
+index ad3c18c..0ab442f 100644
+--- a/Super_VESC_Display/custom/theme_generic.c
++++ b/Super_VESC_Display/custom/theme_generic.c
+@@ -225,7 +225,7 @@ static void g_mode_text(uint8_t mode)
+     if (lv_obj_has_flag(s_w->mode_text, LV_OBJ_FLAG_HIDDEN))
+         lv_obj_clear_flag(s_w->mode_text, LV_OBJ_FLAG_HIDDEN);   /* re-show after no-Lisp */
+     char text[16];
+-    snprintf(text, sizeof(text), "MODE %d", mode + 1);
++    snprintf(text, sizeof(text), "%s", ride_profile_name(mode));
+     dash_label_set(s_w->mode_text, text);
+ }
+ 
+diff --git a/components/vesc_can/include/vesc_can/vesc_lisp_panel.h b/components/vesc_can/include/vesc_can/vesc_lisp_panel.h
+index eebea13..32a5b1f 100644
+--- a/components/vesc_can/include/vesc_can/vesc_lisp_panel.h
++++ b/components/vesc_can/include/vesc_can/vesc_lisp_panel.h
+@@ -55,6 +55,13 @@ extern "C" {
+ #define VLP_MSG_REQ_STATE 0x03u
+ #define VLP_MSG_REQ_DASH  0x04u   /* request dashboard stats (cruise + profile) */
+ #define VLP_MSG_PAS_SET   0x05u   /* P4 -> LISP: [i32 pas_amps*1000] PAS target current (fire-and-forget) */
++/* Immobiliser + ride-profile control. NOTE: unlike every other value on this
++ * wire these payloads are RAW int32 (no x1000 scale) — a PIN is an integer, not
++ * a measurement, and scaling it would only invite rounding surprises. */
++#define VLP_MSG_UNLOCK    0x06u   /* P4 -> LISP: [i32 pin] */
++#define VLP_MSG_LOCK      0x07u   /* P4 -> LISP: [] immobilise now */
++#define VLP_MSG_PROFILE   0x08u   /* P4 -> LISP: [i32 profile_idx] */
++#define VLP_MSG_SET_PIN   0x09u   /* P4 -> LISP: [i32 old_pin][i32 new_pin], new=0 clears */
+ /* LISP -> P4 */
+ #define VLP_MSG_UI_DESC   0x81u
+ #define VLP_MSG_STATE     0x82u
+@@ -102,6 +109,15 @@ typedef struct {
+     float cruise_rpm;
+     int   current_profile;
+     float rpm_per_ms;
++    /* --- appended by DASH v2 (lisp/main.lisp with the immobiliser). A script
++     * without it sends only the four fields above; these then stay at their
++     * "no immobiliser" defaults (locked=false, pin_set=false) so the head unit
++     * behaves exactly as before against an older script. --- */
++    bool  locked;           /* drive current inhibited on the VESC */
++    bool  pin_set;          /* a PIN is configured in the VESC's EEPROM */
++    int   pin_tries;        /* consecutive wrong entries (>4 = 30 s penalty) */
++    int   profile_count;    /* profiles the script offers (0 = unknown) */
++    bool  pin_ok;           /* PIN satisfied this power cycle */
+ } vlp_dash_t;
+ 
+ /* target_vesc_id = the VESC node running the master LISP script. The reply
+@@ -135,6 +151,19 @@ bool vesc_lisp_panel_get_dash(vlp_dash_t *out);
+  * it just queues the action; poll_loop sends it from the CAN poll task. */
+ void vesc_lisp_panel_send_action(uint8_t ctrl_id, float value);
+ 
++/* Immobiliser + ride profile. Safe to call from the LVGL task: like
++ * send_action these only queue, and the send happens on the CAN poll task.
++ * Unlike send_action they are NOT gated on the panel drawer being open — the
++ * lock screen needs them whatever is on screen. Confirmation is observed via
++ * get_dash (the script replies with a DASH packet to every one of these).
++ *
++ * send_lock() is advisory: the script refuses to engage the lock while the
++ * wheel is turning, and the refusal shows up as dash.locked staying false. */
++void vesc_lisp_panel_send_unlock(int32_t pin);
++void vesc_lisp_panel_send_lock(void);
++void vesc_lisp_panel_send_profile(int32_t profile_idx);
++void vesc_lisp_panel_send_set_pin(int32_t old_pin, int32_t new_pin);
++
+ /* Pedal-assist (PAS) setpoint forwarding to the master LISP script.
+  *
+  * vesc_lisp_panel_set_pas() stores the requested PAS current (amps); it is
+diff --git a/components/vesc_can/vesc_lisp_panel.c b/components/vesc_can/vesc_lisp_panel.c
+index dec56e3..4fea6c4 100644
+--- a/components/vesc_can/vesc_lisp_panel.c
++++ b/components/vesc_can/vesc_lisp_panel.c
+@@ -56,6 +56,14 @@ static bool               s_pas_sent_zero;   /* latched after the watchdog coast
+ 
+ typedef struct { uint8_t id; float value; } vlp_action_t;
+ 
++/* Immobiliser / profile commands. Separate from the action queue because the
++ * action queue is only drained while the panel drawer is open (poll_loop) and
++ * the lock screen must work with the drawer shut — these are drained from
++ * dash_loop, which always runs. Two raw int32 args, no x1000 scaling. */
++#define VLP_CMD_QUEUE_LEN  4
++typedef struct { uint8_t msg; int32_t a, b; } vlp_cmd_t;
++static QueueHandle_t s_cmd_q;
++
+ static inline uint32_t millis_now(void)
+ {
+     return (uint32_t)(esp_timer_get_time() / 1000);
+@@ -70,6 +78,9 @@ void vesc_lisp_panel_init(uint8_t target_vesc_id)
+     if (!s_action_q) {
+         s_action_q = xQueueCreate(VLP_ACTION_QUEUE_LEN, sizeof(vlp_action_t));
+     }
++    if (!s_cmd_q) {
++        s_cmd_q = xQueueCreate(VLP_CMD_QUEUE_LEN, sizeof(vlp_cmd_t));
++    }
+     s_enabled = false;
+     portENTER_CRITICAL(&s_pas_mux);
+     s_pas_amps        = 0.0f;
+@@ -134,6 +145,39 @@ void vesc_lisp_panel_send_action(uint8_t ctrl_id, float value)
+     xQueueSend(s_action_q, &a, 0);
+ }
+ 
++/* ---- immobiliser / ride profile ---- */
++
++/* Runs on the CAN poll task. Raw int32 payload (see VLP_MSG_UNLOCK). */
++static void send_cmd(const vlp_cmd_t *c)
++{
++    uint8_t buf[20];
++    int32_t ind = 0;
++    buf[ind++] = COMM_CUSTOM_APP_DATA;
++    buf[ind++] = VLP_MAGIC0;
++    buf[ind++] = VLP_MAGIC1;
++    buf[ind++] = c->msg;
++    buf[ind++] = comm_can_get_local_id();   /* reply_can_id */
++    if (c->msg != VLP_MSG_LOCK) {
++        buffer_append_int32(buf, c->a, &ind);
++    }
++    if (c->msg == VLP_MSG_SET_PIN) {
++        buffer_append_int32(buf, c->b, &ind);
++    }
++    comm_can_send_buffer_sync(s_target_vesc_id, buf, (unsigned int)ind, 0, 60);
++}
++
++static void queue_cmd(uint8_t msg, int32_t a, int32_t b)
++{
++    if (!s_cmd_q) return;
++    vlp_cmd_t c = { .msg = msg, .a = a, .b = b };
++    xQueueSend(s_cmd_q, &c, 0);
++}
++
++void vesc_lisp_panel_send_unlock(int32_t pin)        { queue_cmd(VLP_MSG_UNLOCK, pin, 0); }
++void vesc_lisp_panel_send_lock(void)                 { queue_cmd(VLP_MSG_LOCK, 0, 0); }
++void vesc_lisp_panel_send_profile(int32_t idx)       { queue_cmd(VLP_MSG_PROFILE, idx, 0); }
++void vesc_lisp_panel_send_set_pin(int32_t o, int32_t n) { queue_cmd(VLP_MSG_SET_PIN, o, n); }
++
+ /* ---- PAS setpoint forwarding ---- */
+ 
+ static void send_pas(float amps)
+@@ -236,6 +280,16 @@ void vesc_lisp_panel_request_dash(void)
+ 
+ void vesc_lisp_panel_dash_loop(void)
+ {
++    /* Lock/profile commands go out first and unthrottled — an unlock tap must
++     * not wait on the 200 ms dash cadence. Each one gets a DASH reply from the
++     * script, which is how the lock screen learns it worked. */
++    if (s_cmd_q) {
++        vlp_cmd_t c;
++        while (xQueueReceive(s_cmd_q, &c, 0) == pdTRUE) {
++            send_cmd(&c);
++        }
++    }
++
+     /* Always-on (not gated by s_enabled): the dashboard needs cruise/profile
+      * whether or not the drawer is open. Runs on the same rt_task as the other
+      * polls, so its reply is serialised with them. */
+@@ -352,12 +406,31 @@ static void parse_dash(const uint8_t *data, unsigned int len, int32_t ind)
+     float   cr = buffer_get_float32(data, VLP_SCALE, &ind);
+     int32_t cp = buffer_get_int32(data, &ind);
+     float   rpm = buffer_get_float32(data, VLP_SCALE, &ind);
++
++    /* DASH v2 tail. Optional: a script without the immobiliser sends only the
++     * four fields above, so absence means "no lock feature", not "unlocked by
++     * mistake" — hence the defaults below rather than leaving stale values. */
++    bool have_v2 = (ind + 20 <= (int)len);
++    int32_t lk = 0, ps = 0, pt = 0, pc = 0, pok = 0;
++    if (have_v2) {
++        lk  = buffer_get_int32(data, &ind);
++        ps  = buffer_get_int32(data, &ind);
++        pt  = buffer_get_int32(data, &ind);
++        pc  = buffer_get_int32(data, &ind);
++        pok = buffer_get_int32(data, &ind);
++    }
++
+     if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
+         s_dash.valid           = true;
+         s_dash.cruise_active   = (ca != 0);
+         s_dash.cruise_rpm      = cr;
+         s_dash.current_profile = cp / 1000;     /* sent as profile × 1000 */
+         s_dash.rpm_per_ms      = rpm;
++        s_dash.locked          = have_v2 && (lk != 0);
++        s_dash.pin_set         = have_v2 && (ps != 0);
++        s_dash.pin_ok          = have_v2 ? (pok != 0) : true;
++        s_dash.pin_tries       = have_v2 ? pt / 1000 : 0;
++        s_dash.profile_count   = have_v2 ? pc / 1000 : 0;
+         xSemaphoreGive(s_lock);
+     }
+ }
+diff --git a/lisp/main.lisp b/lisp/main.lisp
+index 1334787..5a43c82 100644
+--- a/lisp/main.lisp
++++ b/lisp/main.lisp
+@@ -19,9 +19,28 @@
+ (def ctl-dt 0.01)          ; arbiter period (s)
+ (def thr-curve-accel 0.0)  ; throttle-curve accel const, -1..1 (0 = linear)
+ (def thr-curve-mode 0)     ; 0 exponential, 1 natural, 2 polynomial
+-(def current-profile 0)
+-(def num-profiles 3)
++; ---- ride profiles + PIN immobiliser -------------------------------------
++; EEPROM slots 0/1 are the beep/melody volumes; 2..4 are ours.
++(def pin-addr 2)          ; hash of the PIN (0 = no PIN configured)
++(def pin-enable-addr 3)   ; 1 = require the PIN at every power-on
++(def profile-addr 4)      ; last selected profile
++(def num-profiles 3)      ; 0 = ECO, 1 = NORMAL, 2 = SPORT
++(def sport-needs-pin 1)   ; SPORT is PIN-gated even after the bike is unlocked
++(def current-profile (let ((v (eeprom-read-i profile-addr)))
++                       (if (and v (>= v 0) (< v num-profiles)) v 0)))
+ (def first-profile-init 1)
++; pin-hash-v / pin-required are read once here and setq'd by set-pin, so they
++; MUST stay above @const-start like every other mutable global.
++(def pin-hash-v (let ((v (eeprom-read-i pin-addr))) (if v v 0)))
++(def pin-required (let ((v (eeprom-read-i pin-enable-addr)))
++                    (if (and v (= v 1)) 1 0)))
++; locked = the immobiliser. While 1 the arbiter commands no drive current AND
++; the drive current scale is held at 0, so the bike does not move. Brakes are
++; never touched by any of this.
++(def locked (if (and (= pin-required 1) (not (= pin-hash-v 0))) 1 0))
++(def pin-ok  (if (= pin-hash-v 0) 1 0))   ; PIN satisfied this power cycle
++(def pin-tries 0)
++(def pin-lockout 0)
+ (def rpm-per-ms 0.0)
+ (def throttle-on 1)
+ (def tc-on 0)
+@@ -55,39 +74,119 @@
+ ; Profiles scale the current limit instead of overwriting it: Motor Current Max
+ ; in VESC Tool stays the master value (applied live, no LISP restart) and each
+ ; profile is a fraction of it. Braking is never scaled — always full.
++(defun profile-speed (i) (if (= i 0) 25.0 (if (= i 1) 40.0 60.0)))
++(defun profile-scale (i) (if (= i 0) 0.5 (if (= i 1) 0.67 1.0)))
++; Which profiles are PIN-gated. SPORT is by default: hand the bike to someone
++; else after unlocking and they still cannot reach full power.
++(defun profile-needs-pin (i) (if (and (= i 2) (= sport-needs-pin 1)) 1 0))
++(defun profile-allowed (i)
++    (and (>= i 0) (< i num-profiles)
++         (or (= (profile-needs-pin i) 0) (= pin-ok 1))))
++(defun profile-beep (i) {
++    (foc-play-tone 0 (if (= i 0) 500 (if (= i 1) 750 1000)) 10)
++    (spawn 150 play-stop)
++})
++; Returns 1 if the profile was applied, 0 if it was refused (PIN needed / bad
++; index). While locked the scale stays at 0 — see apply-lock-scale — and the
++; selected profile is only re-applied on unlock.
+ (defun apply-profile (profile-index) {
+-    (if (= profile-index 0) {
+-        (conf-set 'max-speed (/ 25.0 3.6))
+-        (conf-set 'l-current-max-scale 0.5)
+-        (print "Profile 0: Slow (25 km/h, 50% current)")
++    (if (not (profile-allowed profile-index)) {
++        (print "Profile refused: PIN required or bad index")
++        (foc-play-tone 0 300 10)
++        (spawn 150 play-stop)
++        0
+     } {
+-        (if (= profile-index 1) {
+-            (conf-set 'max-speed (/ 40.0 3.6))
+-            (conf-set 'l-current-max-scale 0.67)
+-            (print "Profile 1: Medium (40 km/h, 67% current)")
+-        } {
+-            (if (= profile-index 2) {
+-                (conf-set 'max-speed (/ 60.0 3.6))
+-                (conf-set 'l-current-max-scale 1.0)
+-                (print "Profile 2: Fast (60 km/h, 100% current)")
+-            })
+-        })
++        (setq current-profile profile-index)
++        (conf-set 'max-speed (/ (profile-speed profile-index) 3.6))
++        (if (= locked 0)
++            (conf-set 'l-current-max-scale (profile-scale profile-index)))
++        (let ((saved (eeprom-read-i profile-addr)))
++            (if (not (and saved (= saved profile-index)))
++                (eeprom-store-i profile-addr profile-index)))
++        (print (str-merge "Profile " (to-str profile-index)))
++        (if (= first-profile-init 0)
++            (profile-beep profile-index)
++            (setq first-profile-init 0))
++        1
+     })
+-    (if (= first-profile-init 0) {
+-        (let ((beep-freq (if (= profile-index 0) {
+-            500
++})
++; ---- immobiliser ---------------------------------------------------------
++; Zeroing the drive scale is belt-and-braces. If this script ever dies the
++; arbiter stops extending app-disable-output and ~1.5 s later the stock ADC
++; throttle comes back — with the scale at 0 that throttle commands ~0 A, so a
++; crashed script does not silently un-immobilise the bike. conf-set is RAM
++; only, so a power cycle restores the VESC Tool values and this script re-
++; applies the lock at boot.
++(defun apply-lock-scale () {
++    (conf-set 'l-current-max-scale 0.0)
++    (conf-set 'max-speed 0.0)
++})
++; Simple modular hash so the PIN is not sitting in EEPROM in the clear. This is
++; obfuscation, not cryptography — anyone with VESC Tool over USB can read the
++; slot, dump this script and see the algorithm. Treat the whole feature as a
++; valet / deterrent lock, not as theft protection.
++(defun pin-hash-r (h v n)
++    (if (= n 0) h
++        (pin-hash-r (mod (+ (* h 31) (+ 1 (mod v 10))) 1000003) (/ v 10) (- n 1))))
++(defun pin-hash (p) (pin-hash-r 7919 (to-i32 p) 8))
++; Never engage the lock while the bike is rolling: dropping drive power under a
++; rider mid-corner is exactly the kind of thing that puts people on the floor.
++(defun lock-now () {
++    (if (> (abs (get-speed)) 0.5) {
++        (print "Refusing to lock: still moving")
++        0
++    } {
++        (if (= cruise-active 1) (deactivate-cruise-control))
++        (setq locked 1)
++        (setq pin-ok 0)
++        (apply-lock-scale)
++        (print "Locked")
++        1
++    })
++})
++(defun unlock-with-pin (p) {
++    (if (= pin-hash-v 0) {
++        (setq pin-ok 1) (setq locked 0) (apply-profile current-profile) 1
++    } {
++        ; 5 wrong entries buys a 30 s penalty — stops someone brute-forcing a
++        ; 4-digit PIN on the touchscreen in a car park.
++        (if (and (> pin-tries 4) (< (secs-since pin-lockout) 30.0)) {
++            (print "PIN lockout active")
++            0
+         } {
+-            (if (= profile-index 1) {
+-                750
++            (if (= (pin-hash p) pin-hash-v) {
++                (setq pin-ok 1)
++                (setq pin-tries 0)
++                (setq locked 0)
++                (apply-profile current-profile)
++                (foc-play-tone 0 900 beep-vol)
++                (spawn 150 play-stop)
++                (print "Unlocked")
++                1
+             } {
+-                1000
++                (setq pin-tries (+ pin-tries 1))
++                (if (> pin-tries 4) (setq pin-lockout (systime)))
++                (foc-play-tone 0 200 beep-vol)
++                (spawn 150 play-stop)
++                (print "Wrong PIN")
++                0
+             })
+-        }))) {
+-            (foc-play-tone 0 beep-freq 10)
+-            (spawn 150 play-stop)
+         })
++    })
++})
++; new = 0 clears the PIN and disables the immobiliser entirely.
++(defun set-pin (old new) {
++    (if (or (= pin-hash-v 0) (= (pin-hash old) pin-hash-v)) {
++        (setq pin-hash-v (if (= new 0) 0 (pin-hash new)))
++        (eeprom-store-i pin-addr pin-hash-v)
++        (setq pin-required (if (= new 0) 0 1))
++        (eeprom-store-i pin-enable-addr pin-required)
++        (if (= new 0) { (setq locked 0) (setq pin-ok 1) })
++        (print "PIN updated")
++        1
+     } {
+-        (setq first-profile-init 0)
++        (print "PIN change refused: wrong current PIN")
++        0
+     })
+ })
+ (gpio-configure 'pin-rx 'pin-mode-in-pu)
+@@ -112,7 +211,7 @@
+ ; loop keeps commanding current smoothly. (De)activation just flips state; the
+ ; arbiter (motor-control-loop) does everything else.
+ (defun activate-cruise-control () {
+-    (if (and (= cruise-active 0) (= throttle-on 1)) {
++    (if (and (= cruise-active 0) (= throttle-on 1) (= locked 0)) {
+         (setq cruise-rpm (get-rpm))
+         (if (> (abs cruise-rpm) 0) {
+             (setq cruise-i (get-current))   ; bumpless transfer
+@@ -173,12 +272,17 @@
+         (sleep 0.05)
+     })
+ })
++; Handlebar TX button. Skips any profile the current PIN state does not allow,
++; so the button cycles ECO -> NORMAL while SPORT is PIN-gated and locked out.
++(defun next-allowed (i n)
++    (if (= n 0) current-profile
++        (if (profile-allowed i) i
++            (next-allowed (mod (+ i 1) num-profiles) (- n 1)))))
+ (defun switch-profile () {
+-    (setq current-profile (+ current-profile 1))
+-    (if (>= current-profile num-profiles) {
+-        (setq current-profile 0)
+-    })
+-    (apply-profile current-profile)
++    (if (= locked 1)
++        (print "Locked: profile change ignored")
++        (apply-profile (next-allowed (mod (+ current-profile 1) num-profiles)
++                                    num-profiles)))
+ })
+ (defun decrease-cruise-speed () {
+     (if (= cruise-active 1) {
+@@ -221,7 +325,11 @@
+         (sleep 0.05)
+     })
+ })
+-(apply-profile 0)
++; Boot straight into the immobilised state when a PIN is configured, otherwise
++; restore the last profile (falling back to ECO if it is PIN-gated).
++(if (= locked 1)
++    (apply-lock-scale)
++    (apply-profile (if (profile-allowed current-profile) current-profile 0)))
+ (spawn 150 update-rpm-per-ms)
+ (spawn 150 monitor-rx-button)
+ (spawn 150 monitor-tx-button)
+@@ -256,6 +364,12 @@
+     (pi32 (* cruise-rpm 1000))
+     (pi32 (* current-profile 1000))
+     (pi32 (* rpm-per-ms 1000.0))
++    ; --- appended in v2; older head units stop parsing after the 4 above ---
++    (pi32 (* locked 1000))
++    (pi32 (* (if (= pin-hash-v 0) 0 1) 1000))   ; a PIN is configured
++    (pi32 (* pin-tries 1000))
++    (pi32 (* num-profiles 1000))
++    (pi32 (* (if (= pin-ok 1) 1 0) 1000))       ; PIN satisfied this power cycle
+     (send-data pbuf 2 reply-id)
+ })
+ ; Master enable is just a flag now — the motor arbiter owns all output and
+@@ -352,6 +466,19 @@
+                     (setq pas-amps (/ (bufget-i32 data 4) 1000.0))
+                     (setq pas-seen (systime))
+                 })
++                ; --- immobiliser / profile control (raw i32, NOT x1000) ---
++                ((= msg 0x06) {                     ; unlock: [i32 pin]
++                    (unlock-with-pin (bufget-i32 data 4))
++                    (panel-send-dash reply-id) })
++                ((= msg 0x07) {                     ; lock now
++                    (lock-now)
++                    (panel-send-dash reply-id) })
++                ((= msg 0x08) {                     ; select profile: [i32 idx]
++                    (apply-profile (bufget-i32 data 4))
++                    (panel-send-dash reply-id) })
++                ((= msg 0x09) {                     ; PIN change: [i32 old][i32 new]
++                    (set-pin (bufget-i32 data 4) (bufget-i32 data 8))
++                    (panel-send-dash reply-id) })
+                 ((= msg 0x02)
+                     (let ((cid (bufget-u8 data 4))
+                           (val (/ (bufget-i32 data 5) 1000.0))) {
+@@ -444,6 +571,13 @@
+             ; once (protects against a stuck/held throttle at script start).
+             (if (< thr 0.05) (setq armed 1))
+             (if (= armed 0) (setq thr 0.0))
++            ; Immobiliser: kill the throttle request outright. Deliberately
++            ; NOT a branch above the brake — regen braking must keep working
++            ; while locked (the bike can still be rolled or pushed downhill).
++            (if (= locked 1) {
++                (setq thr 0.0)
++                (if (= cruise-active 1) (deactivate-cruise-control))
++            })
+             ; A branch stays selected while its slew tails off (out-rel /
+             ; brk-rel > 0), so releasing throttle or brake ramps down smoothly
+             ; instead of stepping the current to 0.
+@@ -459,9 +593,10 @@
+                 ((or (> thr 0.05) (> out-rel 0.001)) {    ; 2. throttle
+                     (if (> thr 0.05) (deactivate-cruise-control))
+                     (throttle-out thr) })
+-                ((= cruise-active 1)          ; 3. cruise (PI → current)
++                ((and (= locked 0) (= cruise-active 1))   ; 3. cruise (PI → current)
+                     (cruise-out))
+-                ((and (> pas-amps 0.0)        ; 4. pedal assist from head unit
++                ((and (= locked 0)            ; 4. pedal assist from head unit
++                      (> pas-amps 0.0)
+                       (< (secs-since pas-seen) 0.4))
+                     ; Stale setpoint (sensor/link dropped) falls through to
+                     ; coast — the P4 watchdog also sends an explicit 0.
+diff --git a/main/vesc_ui_updater.c b/main/vesc_ui_updater.c
+index 787af75..93a59c5 100644
+--- a/main/vesc_ui_updater.c
++++ b/main/vesc_ui_updater.c
+@@ -175,10 +175,31 @@ static void push_cruise_locked(void)
+ /* Runs inside lv_timer_handler() with the LVGL lock already held — zero
+  * contention with the render task (it's the same task). 10 Hz is plenty
+  * for a dashboard; numeric fields don't benefit from higher refresh. */
++/* The immobiliser overlay must be driven no matter what is on screen — the
++ * bike can be locked while Android Auto video is up, and the early return
++ * below would otherwise leave the PIN keypad unbuilt (or stale) until the
++ * rider happened to navigate back to the dashboard. Runs before that return.
++ *
++ * A script with no immobiliser reports locked=false forever (see the DASH v2
++ * note in vesc_lisp_panel.h), so this is inert on such a setup. */
++static void push_lock_overlay(void)
++{
++    vlp_dash_t d;
++    if (!vesc_lisp_panel_get_dash(&d)) {
++        /* No Lisp data at all — e.g. CAN down. Deliberately do NOT put the
++         * keypad up here: a CAN dropout must not paint an "immobilised" screen
++         * over a bike that is, as far as we know, moving. */
++        return;
++    }
++    lock_overlay_set_state(d.locked, d.pin_set, d.pin_tries);
++}
++
+ static void updater_lv_timer_cb(lv_timer_t *t)
+ {
+     (void)t;
+ 
++    push_lock_overlay();
++
+     /* Only write dashboard widgets while the dashboard is the active screen.
+      * These setters target widgets that live on the dashboard screen; when
+      * Settings / Statistics / the LISP editor / AA video / idle is showing,
