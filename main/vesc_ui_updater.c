@@ -175,9 +175,30 @@ static void push_cruise_locked(void)
 /* Runs inside lv_timer_handler() with the LVGL lock already held — zero
  * contention with the render task (it's the same task). 10 Hz is plenty
  * for a dashboard; numeric fields don't benefit from higher refresh. */
+/* The immobiliser overlay must be driven no matter what is on screen — the
+ * bike can be locked while Android Auto video is up, and the early return
+ * below would otherwise leave the PIN keypad unbuilt (or stale) until the
+ * rider happened to navigate back to the dashboard. Runs before that return.
+ *
+ * A script with no immobiliser reports locked=false forever (see the DASH v2
+ * note in vesc_lisp_panel.h), so this is inert on such a setup. */
+static void push_lock_overlay(void)
+{
+    vlp_dash_t d;
+    if (!vesc_lisp_panel_get_dash(&d)) {
+        /* No Lisp data at all — e.g. CAN down. Deliberately do NOT put the
+         * keypad up here: a CAN dropout must not paint an "immobilised" screen
+         * over a bike that is, as far as we know, moving. */
+        return;
+    }
+    lock_overlay_set_state(d.locked, d.pin_set, d.pin_tries);
+}
+
 static void updater_lv_timer_cb(lv_timer_t *t)
 {
     (void)t;
+
+    push_lock_overlay();
 
     /* Only write dashboard widgets while the dashboard is the active screen.
      * These setters target widgets that live on the dashboard screen; when
