@@ -19,9 +19,28 @@
 (def ctl-dt 0.01)          ; arbiter period (s)
 (def thr-curve-accel 0.0)  ; throttle-curve accel const, -1..1 (0 = linear)
 (def thr-curve-mode 0)     ; 0 exponential, 1 natural, 2 polynomial
-(def current-profile 0)
-(def num-profiles 3)
+; ---- ride profiles + PIN immobiliser -------------------------------------
+; EEPROM slots 0/1 are the beep/melody volumes; 2..4 are ours.
+(def pin-addr 2)          ; hash of the PIN (0 = no PIN configured)
+(def pin-enable-addr 3)   ; 1 = require the PIN at every power-on
+(def profile-addr 4)      ; last selected profile
+(def num-profiles 3)      ; 0 = ECO, 1 = NORMAL, 2 = SPORT
+(def sport-needs-pin 1)   ; SPORT is PIN-gated even after the bike is unlocked
+(def current-profile (let ((v (eeprom-read-i profile-addr)))
+                       (if (and v (>= v 0) (< v num-profiles)) v 0)))
 (def first-profile-init 1)
+; pin-hash-v / pin-required are read once here and setq'd by set-pin, so they
+; MUST stay above @const-start like every other mutable global.
+(def pin-hash-v (let ((v (eeprom-read-i pin-addr))) (if v v 0)))
+(def pin-required (let ((v (eeprom-read-i pin-enable-addr)))
+                    (if (and v (= v 1)) 1 0)))
+; locked = the immobiliser. While 1 the arbiter commands no drive current AND
+; the drive current scale is held at 0, so the bike does not move. Brakes are
+; never touched by any of this.
+(def locked (if (and (= pin-required 1) (not (= pin-hash-v 0))) 1 0))
+(def pin-ok  (if (= pin-hash-v 0) 1 0))   ; PIN satisfied this power cycle
+(def pin-tries 0)
+(def pin-lockout 0)
 (def rpm-per-ms 0.0)
 (def throttle-on 1)
 (def tc-on 0)
@@ -55,39 +74,119 @@
 ; Profiles scale the current limit instead of overwriting it: Motor Current Max
 ; in VESC Tool stays the master value (applied live, no LISP restart) and each
 ; profile is a fraction of it. Braking is never scaled — always full.
+(defun profile-speed (i) (if (= i 0) 25.0 (if (= i 1) 40.0 60.0)))
+(defun profile-scale (i) (if (= i 0) 0.5 (if (= i 1) 0.67 1.0)))
+; Which profiles are PIN-gated. SPORT is by default: hand the bike to someone
+; else after unlocking and they still cannot reach full power.
+(defun profile-needs-pin (i) (if (and (= i 2) (= sport-needs-pin 1)) 1 0))
+(defun profile-allowed (i)
+    (and (>= i 0) (< i num-profiles)
+         (or (= (profile-needs-pin i) 0) (= pin-ok 1))))
+(defun profile-beep (i) {
+    (foc-play-tone 0 (if (= i 0) 500 (if (= i 1) 750 1000)) 10)
+    (spawn 150 play-stop)
+})
+; Returns 1 if the profile was applied, 0 if it was refused (PIN needed / bad
+; index). While locked the scale stays at 0 — see apply-lock-scale — and the
+; selected profile is only re-applied on unlock.
 (defun apply-profile (profile-index) {
-    (if (= profile-index 0) {
-        (conf-set 'max-speed (/ 25.0 3.6))
-        (conf-set 'l-current-max-scale 0.5)
-        (print "Profile 0: Slow (25 km/h, 50% current)")
+    (if (not (profile-allowed profile-index)) {
+        (print "Profile refused: PIN required or bad index")
+        (foc-play-tone 0 300 10)
+        (spawn 150 play-stop)
+        0
     } {
-        (if (= profile-index 1) {
-            (conf-set 'max-speed (/ 40.0 3.6))
-            (conf-set 'l-current-max-scale 0.67)
-            (print "Profile 1: Medium (40 km/h, 67% current)")
+        (setq current-profile profile-index)
+        (conf-set 'max-speed (/ (profile-speed profile-index) 3.6))
+        (if (= locked 0)
+            (conf-set 'l-current-max-scale (profile-scale profile-index)))
+        (let ((saved (eeprom-read-i profile-addr)))
+            (if (not (and saved (= saved profile-index)))
+                (eeprom-store-i profile-addr profile-index)))
+        (print (str-merge "Profile " (to-str profile-index)))
+        (if (= first-profile-init 0)
+            (profile-beep profile-index)
+            (setq first-profile-init 0))
+        1
+    })
+})
+; ---- immobiliser ---------------------------------------------------------
+; Zeroing the drive scale is belt-and-braces. If this script ever dies the
+; arbiter stops extending app-disable-output and ~1.5 s later the stock ADC
+; throttle comes back — with the scale at 0 that throttle commands ~0 A, so a
+; crashed script does not silently un-immobilise the bike. conf-set is RAM
+; only, so a power cycle restores the VESC Tool values and this script re-
+; applies the lock at boot.
+(defun apply-lock-scale () {
+    (conf-set 'l-current-max-scale 0.0)
+    (conf-set 'max-speed 0.0)
+})
+; Simple modular hash so the PIN is not sitting in EEPROM in the clear. This is
+; obfuscation, not cryptography — anyone with VESC Tool over USB can read the
+; slot, dump this script and see the algorithm. Treat the whole feature as a
+; valet / deterrent lock, not as theft protection.
+(defun pin-hash-r (h v n)
+    (if (= n 0) h
+        (pin-hash-r (mod (+ (* h 31) (+ 1 (mod v 10))) 1000003) (/ v 10) (- n 1))))
+(defun pin-hash (p) (pin-hash-r 7919 (to-i32 p) 8))
+; Never engage the lock while the bike is rolling: dropping drive power under a
+; rider mid-corner is exactly the kind of thing that puts people on the floor.
+(defun lock-now () {
+    (if (> (abs (get-speed)) 0.5) {
+        (print "Refusing to lock: still moving")
+        0
+    } {
+        (if (= cruise-active 1) (deactivate-cruise-control))
+        (setq locked 1)
+        (setq pin-ok 0)
+        (apply-lock-scale)
+        (print "Locked")
+        1
+    })
+})
+(defun unlock-with-pin (p) {
+    (if (= pin-hash-v 0) {
+        (setq pin-ok 1) (setq locked 0) (apply-profile current-profile) 1
+    } {
+        ; 5 wrong entries buys a 30 s penalty — stops someone brute-forcing a
+        ; 4-digit PIN on the touchscreen in a car park.
+        (if (and (> pin-tries 4) (< (secs-since pin-lockout) 30.0)) {
+            (print "PIN lockout active")
+            0
         } {
-            (if (= profile-index 2) {
-                (conf-set 'max-speed (/ 60.0 3.6))
-                (conf-set 'l-current-max-scale 1.0)
-                (print "Profile 2: Fast (60 km/h, 100% current)")
+            (if (= (pin-hash p) pin-hash-v) {
+                (setq pin-ok 1)
+                (setq pin-tries 0)
+                (setq locked 0)
+                (apply-profile current-profile)
+                (foc-play-tone 0 900 beep-vol)
+                (spawn 150 play-stop)
+                (print "Unlocked")
+                1
+            } {
+                (setq pin-tries (+ pin-tries 1))
+                (if (> pin-tries 4) (setq pin-lockout (systime)))
+                (foc-play-tone 0 200 beep-vol)
+                (spawn 150 play-stop)
+                (print "Wrong PIN")
+                0
             })
         })
     })
-    (if (= first-profile-init 0) {
-        (let ((beep-freq (if (= profile-index 0) {
-            500
-        } {
-            (if (= profile-index 1) {
-                750
-            } {
-                1000
-            })
-        }))) {
-            (foc-play-tone 0 beep-freq 10)
-            (spawn 150 play-stop)
-        })
+})
+; new = 0 clears the PIN and disables the immobiliser entirely.
+(defun set-pin (old new) {
+    (if (or (= pin-hash-v 0) (= (pin-hash old) pin-hash-v)) {
+        (setq pin-hash-v (if (= new 0) 0 (pin-hash new)))
+        (eeprom-store-i pin-addr pin-hash-v)
+        (setq pin-required (if (= new 0) 0 1))
+        (eeprom-store-i pin-enable-addr pin-required)
+        (if (= new 0) { (setq locked 0) (setq pin-ok 1) })
+        (print "PIN updated")
+        1
     } {
-        (setq first-profile-init 0)
+        (print "PIN change refused: wrong current PIN")
+        0
     })
 })
 (gpio-configure 'pin-rx 'pin-mode-in-pu)
@@ -112,7 +211,7 @@
 ; loop keeps commanding current smoothly. (De)activation just flips state; the
 ; arbiter (motor-control-loop) does everything else.
 (defun activate-cruise-control () {
-    (if (and (= cruise-active 0) (= throttle-on 1)) {
+    (if (and (= cruise-active 0) (= throttle-on 1) (= locked 0)) {
         (setq cruise-rpm (get-rpm))
         (if (> (abs cruise-rpm) 0) {
             (setq cruise-i (get-current))   ; bumpless transfer
@@ -173,12 +272,17 @@
         (sleep 0.05)
     })
 })
+; Handlebar TX button. Skips any profile the current PIN state does not allow,
+; so the button cycles ECO -> NORMAL while SPORT is PIN-gated and locked out.
+(defun next-allowed (i n)
+    (if (= n 0) current-profile
+        (if (profile-allowed i) i
+            (next-allowed (mod (+ i 1) num-profiles) (- n 1)))))
 (defun switch-profile () {
-    (setq current-profile (+ current-profile 1))
-    (if (>= current-profile num-profiles) {
-        (setq current-profile 0)
-    })
-    (apply-profile current-profile)
+    (if (= locked 1)
+        (print "Locked: profile change ignored")
+        (apply-profile (next-allowed (mod (+ current-profile 1) num-profiles)
+                                    num-profiles)))
 })
 (defun decrease-cruise-speed () {
     (if (= cruise-active 1) {
@@ -221,7 +325,11 @@
         (sleep 0.05)
     })
 })
-(apply-profile 0)
+; Boot straight into the immobilised state when a PIN is configured, otherwise
+; restore the last profile (falling back to ECO if it is PIN-gated).
+(if (= locked 1)
+    (apply-lock-scale)
+    (apply-profile (if (profile-allowed current-profile) current-profile 0)))
 (spawn 150 update-rpm-per-ms)
 (spawn 150 monitor-rx-button)
 (spawn 150 monitor-tx-button)
@@ -256,6 +364,12 @@
     (pi32 (* cruise-rpm 1000))
     (pi32 (* current-profile 1000))
     (pi32 (* rpm-per-ms 1000.0))
+    ; --- appended in v2; older head units stop parsing after the 4 above ---
+    (pi32 (* locked 1000))
+    (pi32 (* (if (= pin-hash-v 0) 0 1) 1000))   ; a PIN is configured
+    (pi32 (* pin-tries 1000))
+    (pi32 (* num-profiles 1000))
+    (pi32 (* (if (= pin-ok 1) 1 0) 1000))       ; PIN satisfied this power cycle
     (send-data pbuf 2 reply-id)
 })
 ; Master enable is just a flag now — the motor arbiter owns all output and
@@ -352,6 +466,19 @@
                     (setq pas-amps (/ (bufget-i32 data 4) 1000.0))
                     (setq pas-seen (systime))
                 })
+                ; --- immobiliser / profile control (raw i32, NOT x1000) ---
+                ((= msg 0x06) {                     ; unlock: [i32 pin]
+                    (unlock-with-pin (bufget-i32 data 4))
+                    (panel-send-dash reply-id) })
+                ((= msg 0x07) {                     ; lock now
+                    (lock-now)
+                    (panel-send-dash reply-id) })
+                ((= msg 0x08) {                     ; select profile: [i32 idx]
+                    (apply-profile (bufget-i32 data 4))
+                    (panel-send-dash reply-id) })
+                ((= msg 0x09) {                     ; PIN change: [i32 old][i32 new]
+                    (set-pin (bufget-i32 data 4) (bufget-i32 data 8))
+                    (panel-send-dash reply-id) })
                 ((= msg 0x02)
                     (let ((cid (bufget-u8 data 4))
                           (val (/ (bufget-i32 data 5) 1000.0))) {
@@ -444,6 +571,13 @@
             ; once (protects against a stuck/held throttle at script start).
             (if (< thr 0.05) (setq armed 1))
             (if (= armed 0) (setq thr 0.0))
+            ; Immobiliser: kill the throttle request outright. Deliberately
+            ; NOT a branch above the brake — regen braking must keep working
+            ; while locked (the bike can still be rolled or pushed downhill).
+            (if (= locked 1) {
+                (setq thr 0.0)
+                (if (= cruise-active 1) (deactivate-cruise-control))
+            })
             ; A branch stays selected while its slew tails off (out-rel /
             ; brk-rel > 0), so releasing throttle or brake ramps down smoothly
             ; instead of stepping the current to 0.
@@ -459,9 +593,10 @@
                 ((or (> thr 0.05) (> out-rel 0.001)) {    ; 2. throttle
                     (if (> thr 0.05) (deactivate-cruise-control))
                     (throttle-out thr) })
-                ((= cruise-active 1)          ; 3. cruise (PI → current)
+                ((and (= locked 0) (= cruise-active 1))   ; 3. cruise (PI → current)
                     (cruise-out))
-                ((and (> pas-amps 0.0)        ; 4. pedal assist from head unit
+                ((and (= locked 0)            ; 4. pedal assist from head unit
+                      (> pas-amps 0.0)
                       (< (secs-since pas-seen) 0.4))
                     ; Stale setpoint (sensor/link dropped) falls through to
                     ; coast — the P4 watchdog also sends an explicit 0.
