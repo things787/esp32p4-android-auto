@@ -56,6 +56,14 @@ static bool               s_pas_sent_zero;   /* latched after the watchdog coast
 
 typedef struct { uint8_t id; float value; } vlp_action_t;
 
+/* Immobiliser / profile commands. Separate from the action queue because the
+ * action queue is only drained while the panel drawer is open (poll_loop) and
+ * the lock screen must work with the drawer shut — these are drained from
+ * dash_loop, which always runs. Two raw int32 args, no x1000 scaling. */
+#define VLP_CMD_QUEUE_LEN  4
+typedef struct { uint8_t msg; int32_t a, b; } vlp_cmd_t;
+static QueueHandle_t s_cmd_q;
+
 static inline uint32_t millis_now(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -69,6 +77,9 @@ void vesc_lisp_panel_init(uint8_t target_vesc_id)
     }
     if (!s_action_q) {
         s_action_q = xQueueCreate(VLP_ACTION_QUEUE_LEN, sizeof(vlp_action_t));
+    }
+    if (!s_cmd_q) {
+        s_cmd_q = xQueueCreate(VLP_CMD_QUEUE_LEN, sizeof(vlp_cmd_t));
     }
     s_enabled = false;
     portENTER_CRITICAL(&s_pas_mux);
@@ -133,6 +144,39 @@ void vesc_lisp_panel_send_action(uint8_t ctrl_id, float value)
     vlp_action_t a = { .id = ctrl_id, .value = value };
     xQueueSend(s_action_q, &a, 0);
 }
+
+/* ---- immobiliser / ride profile ---- */
+
+/* Runs on the CAN poll task. Raw int32 payload (see VLP_MSG_UNLOCK). */
+static void send_cmd(const vlp_cmd_t *c)
+{
+    uint8_t buf[20];
+    int32_t ind = 0;
+    buf[ind++] = COMM_CUSTOM_APP_DATA;
+    buf[ind++] = VLP_MAGIC0;
+    buf[ind++] = VLP_MAGIC1;
+    buf[ind++] = c->msg;
+    buf[ind++] = comm_can_get_local_id();   /* reply_can_id */
+    if (c->msg != VLP_MSG_LOCK) {
+        buffer_append_int32(buf, c->a, &ind);
+    }
+    if (c->msg == VLP_MSG_SET_PIN) {
+        buffer_append_int32(buf, c->b, &ind);
+    }
+    comm_can_send_buffer_sync(s_target_vesc_id, buf, (unsigned int)ind, 0, 60);
+}
+
+static void queue_cmd(uint8_t msg, int32_t a, int32_t b)
+{
+    if (!s_cmd_q) return;
+    vlp_cmd_t c = { .msg = msg, .a = a, .b = b };
+    xQueueSend(s_cmd_q, &c, 0);
+}
+
+void vesc_lisp_panel_send_unlock(int32_t pin)        { queue_cmd(VLP_MSG_UNLOCK, pin, 0); }
+void vesc_lisp_panel_send_lock(void)                 { queue_cmd(VLP_MSG_LOCK, 0, 0); }
+void vesc_lisp_panel_send_profile(int32_t idx)       { queue_cmd(VLP_MSG_PROFILE, idx, 0); }
+void vesc_lisp_panel_send_set_pin(int32_t o, int32_t n) { queue_cmd(VLP_MSG_SET_PIN, o, n); }
 
 /* ---- PAS setpoint forwarding ---- */
 
@@ -236,6 +280,16 @@ void vesc_lisp_panel_request_dash(void)
 
 void vesc_lisp_panel_dash_loop(void)
 {
+    /* Lock/profile commands go out first and unthrottled — an unlock tap must
+     * not wait on the 200 ms dash cadence. Each one gets a DASH reply from the
+     * script, which is how the lock screen learns it worked. */
+    if (s_cmd_q) {
+        vlp_cmd_t c;
+        while (xQueueReceive(s_cmd_q, &c, 0) == pdTRUE) {
+            send_cmd(&c);
+        }
+    }
+
     /* Always-on (not gated by s_enabled): the dashboard needs cruise/profile
      * whether or not the drawer is open. Runs on the same rt_task as the other
      * polls, so its reply is serialised with them. */
@@ -352,12 +406,31 @@ static void parse_dash(const uint8_t *data, unsigned int len, int32_t ind)
     float   cr = buffer_get_float32(data, VLP_SCALE, &ind);
     int32_t cp = buffer_get_int32(data, &ind);
     float   rpm = buffer_get_float32(data, VLP_SCALE, &ind);
+
+    /* DASH v2 tail. Optional: a script without the immobiliser sends only the
+     * four fields above, so absence means "no lock feature", not "unlocked by
+     * mistake" — hence the defaults below rather than leaving stale values. */
+    bool have_v2 = (ind + 20 <= (int)len);
+    int32_t lk = 0, ps = 0, pt = 0, pc = 0, pok = 0;
+    if (have_v2) {
+        lk  = buffer_get_int32(data, &ind);
+        ps  = buffer_get_int32(data, &ind);
+        pt  = buffer_get_int32(data, &ind);
+        pc  = buffer_get_int32(data, &ind);
+        pok = buffer_get_int32(data, &ind);
+    }
+
     if (s_lock && xSemaphoreTake(s_lock, portMAX_DELAY) == pdTRUE) {
         s_dash.valid           = true;
         s_dash.cruise_active   = (ca != 0);
         s_dash.cruise_rpm      = cr;
         s_dash.current_profile = cp / 1000;     /* sent as profile × 1000 */
         s_dash.rpm_per_ms      = rpm;
+        s_dash.locked          = have_v2 && (lk != 0);
+        s_dash.pin_set         = have_v2 && (ps != 0);
+        s_dash.pin_ok          = have_v2 ? (pok != 0) : true;
+        s_dash.pin_tries       = have_v2 ? pt / 1000 : 0;
+        s_dash.profile_count   = have_v2 ? pc / 1000 : 0;
         xSemaphoreGive(s_lock);
     }
 }
