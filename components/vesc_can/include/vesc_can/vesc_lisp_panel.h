@@ -55,6 +55,13 @@ extern "C" {
 #define VLP_MSG_REQ_STATE 0x03u
 #define VLP_MSG_REQ_DASH  0x04u   /* request dashboard stats (cruise + profile) */
 #define VLP_MSG_PAS_SET   0x05u   /* P4 -> LISP: [i32 pas_amps*1000] PAS target current (fire-and-forget) */
+/* Immobiliser + ride-profile control. NOTE: unlike every other value on this
+ * wire these payloads are RAW int32 (no x1000 scale) — a PIN is an integer, not
+ * a measurement, and scaling it would only invite rounding surprises. */
+#define VLP_MSG_UNLOCK    0x06u   /* P4 -> LISP: [i32 pin] */
+#define VLP_MSG_LOCK      0x07u   /* P4 -> LISP: [] immobilise now */
+#define VLP_MSG_PROFILE   0x08u   /* P4 -> LISP: [i32 profile_idx] */
+#define VLP_MSG_SET_PIN   0x09u   /* P4 -> LISP: [i32 old_pin][i32 new_pin], new=0 clears */
 /* LISP -> P4 */
 #define VLP_MSG_UI_DESC   0x81u
 #define VLP_MSG_STATE     0x82u
@@ -102,6 +109,15 @@ typedef struct {
     float cruise_rpm;
     int   current_profile;
     float rpm_per_ms;
+    /* --- appended by DASH v2 (lisp/main.lisp with the immobiliser). A script
+     * without it sends only the four fields above; these then stay at their
+     * "no immobiliser" defaults (locked=false, pin_set=false) so the head unit
+     * behaves exactly as before against an older script. --- */
+    bool  locked;           /* drive current inhibited on the VESC */
+    bool  pin_set;          /* a PIN is configured in the VESC's EEPROM */
+    int   pin_tries;        /* consecutive wrong entries (>4 = 30 s penalty) */
+    int   profile_count;    /* profiles the script offers (0 = unknown) */
+    bool  pin_ok;           /* PIN satisfied this power cycle */
 } vlp_dash_t;
 
 /* target_vesc_id = the VESC node running the master LISP script. The reply
@@ -134,6 +150,19 @@ bool vesc_lisp_panel_get_dash(vlp_dash_t *out);
 /* Button/toggle/slider action. Safe to call from the LVGL task (a tap handler):
  * it just queues the action; poll_loop sends it from the CAN poll task. */
 void vesc_lisp_panel_send_action(uint8_t ctrl_id, float value);
+
+/* Immobiliser + ride profile. Safe to call from the LVGL task: like
+ * send_action these only queue, and the send happens on the CAN poll task.
+ * Unlike send_action they are NOT gated on the panel drawer being open — the
+ * lock screen needs them whatever is on screen. Confirmation is observed via
+ * get_dash (the script replies with a DASH packet to every one of these).
+ *
+ * send_lock() is advisory: the script refuses to engage the lock while the
+ * wheel is turning, and the refusal shows up as dash.locked staying false. */
+void vesc_lisp_panel_send_unlock(int32_t pin);
+void vesc_lisp_panel_send_lock(void);
+void vesc_lisp_panel_send_profile(int32_t profile_idx);
+void vesc_lisp_panel_send_set_pin(int32_t old_pin, int32_t new_pin);
 
 /* Pedal-assist (PAS) setpoint forwarding to the master LISP script.
  *
