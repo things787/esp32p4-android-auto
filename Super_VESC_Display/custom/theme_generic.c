@@ -18,6 +18,7 @@
 
 #include "theme_generic.h"
 #include "settings_wrapper.h"
+#include "custom.h"   /* ride_profile_name() */
 
 #include <stdio.h>
 #include <math.h>
