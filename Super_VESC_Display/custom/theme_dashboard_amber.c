@@ -349,9 +349,7 @@ static void amber_mode_text(uint8_t mode)
     static int old = -1;
     if (mode == old) return;
     old = mode;
-    char text[16];
-    snprintf(text, sizeof(text), "MODE %d", mode + 1);
-    dash_label_set(guider_ui.dashboard_Amber_mode_text, text);
+    dash_label_set(guider_ui.dashboard_Amber_mode_text, ride_profile_name(mode));
 }
 
 static void amber_units_changed(void)

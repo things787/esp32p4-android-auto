@@ -70,6 +70,21 @@ void lisp_panel_open_async(void);
  * phone involvement. Defined in custom/pas_screen.c. */
 void show_pas_settings(void);
 
+/* ---- PIN immobiliser + ride profiles (custom/lock_overlay.c) ----
+ *
+ * The lock itself lives on the VESC (lisp/main.lisp). These are the head-unit
+ * mirror: lock_overlay_set_state() is driven from the dashboard updater with
+ * the state the script reports, and puts up / tears down a full-screen PIN
+ * keypad on lv_layer_top(). Must be called from the LVGL task.
+ *
+ * show_profile_picker() opens the ECO / NORMAL / SPORT modal. Wire it to
+ * whatever gesture suits — a tap on the dashboard MODE label, or a Settings
+ * row. The handlebar TX button keeps cycling profiles on the VESC either way. */
+void        lock_overlay_set_state(bool locked, bool pin_set, int pin_tries);
+bool        lock_overlay_is_shown(void);
+void        show_profile_picker(void);
+const char *ride_profile_name(uint8_t idx);
+
 void update_current(float current);
 void update_speed(float speed);
 void update_battery_proc(float battery_proc);

@@ -1092,7 +1092,7 @@ static void cockpit_mode_text(uint8_t mode)
     old_mode = mode;
 
     char text[20];
-    sprintf(text,"MODE %d", mode+1);
+    snprintf(text, sizeof(text), "%s", ride_profile_name(mode));
     lv_label_set_text(guider_ui.dashboard_Classic_mode_text,text);
 }
 

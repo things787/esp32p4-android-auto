@@ -225,7 +225,7 @@ static void g_mode_text(uint8_t mode)
     if (lv_obj_has_flag(s_w->mode_text, LV_OBJ_FLAG_HIDDEN))
         lv_obj_clear_flag(s_w->mode_text, LV_OBJ_FLAG_HIDDEN);   /* re-show after no-Lisp */
     char text[16];
-    snprintf(text, sizeof(text), "MODE %d", mode + 1);
+    snprintf(text, sizeof(text), "%s", ride_profile_name(mode));
     dash_label_set(s_w->mode_text, text);
 }
 
