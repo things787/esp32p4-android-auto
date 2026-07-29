@@ -1,0 +1,93 @@
+# Builds the ESP32-P4 head-unit firmware for every board on each push.
+#
+# The heavy lifting is done by espressif/esp-idf-ci-action, which runs the given
+# command inside the official ESP-IDF container with export.sh already sourced —
+# so no toolchain install, and no Windows path pain.
+#
+# Note this does NOT validate lisp/main.lisp: that script runs on the VESC's own
+# LispBM runtime and is never compiled by the firmware build. The paren-balance
+# job below is a crude stand-in — it catches the mistake that actually happens
+# when hand-editing Lisp, which is an unbalanced brace.
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      # Build every board even if one fails — a jc4880-only break should not
+      # hide whether waveshare is healthy.
+      fail-fast: false
+      matrix:
+        board: [waveshare, jc4880]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # scripts/midi-parser is a submodule (see .gitmodules).
+          submodules: recursive
+
+      - name: Build ${{ matrix.board }}
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          # Must be >= 5.5 — see main/idf_component.yml.
+          esp_idf_version: v5.5
+          target: esp32p4
+          # Invoked via `bash` on purpose: the executable bit on the script is
+          # easily lost when files are committed from Windows.
+          command: bash scripts/build_board.sh ${{ matrix.board }} build
+
+      - name: Size report
+        if: always()
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5
+          target: esp32p4
+          command: bash scripts/build_board.sh ${{ matrix.board }} size
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.board }}
+          # These three are what a USB flash needs; keep the flasher_args so the
+          # offsets travel with the binaries.
+          path: |
+            build_${{ matrix.board }}/esp32p4_android_auto.bin
+            build_${{ matrix.board }}/bootloader/bootloader.bin
+            build_${{ matrix.board }}/partition_table/partition-table.bin
+            build_${{ matrix.board }}/flasher_args.json
+          if-no-files-found: error
+
+  lisp-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check paren/brace balance in lisp/main.lisp
+        run: |
+          python3 - <<'PY'
+          import sys
+          s = open('lisp/main.lisp').read()
+          depth = line = 1; depth = 0; line = 1
+          instr = incom = False; prev = ''; bad = []
+          for ch in s:
+              if ch == '\n':
+                  line += 1; incom = False; continue
+              if incom: continue
+              if instr:
+                  if ch == '"' and prev != '\\': instr = False
+                  prev = ch; continue
+              if ch == '"': instr = True
+              elif ch == ';': incom = True
+              elif ch in '({': depth += 1
+              elif ch in ')}':
+                  depth -= 1
+                  if depth < 0: bad.append(line); depth = 0
+              prev = ch
+          if depth or bad:
+              print(f"unbalanced: final depth {depth}, stray closers at {bad[:10]}")
+              sys.exit(1)
+          print("main.lisp balanced")
+          PY
